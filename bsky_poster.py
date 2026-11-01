@@ -1245,6 +1245,23 @@ class ProxyClientBuildError(Exception):
     posting without a proxy."""
 
 
+def _apply_httpx_timeout(req, connect=45.0, read=120.0, write=120.0, pool=45.0):
+    """Set a generous timeout on the underlying httpx client.
+    ConnectTimeout is the usual failure mode with slow/dead proxies, so
+    connect is intentionally higher than the library default (~5s)."""
+    try:
+        import httpx
+        req._client.timeout = httpx.Timeout(
+            connect=connect, read=read, write=write, pool=pool
+        )
+    except Exception:
+        try:
+            # Fallback if httpx.Timeout shape differs
+            req._client.timeout = 120.0
+        except Exception:
+            pass
+
+
 def build_bsky_client(proxy_url):
     """Create the atproto Client, routed through `proxy_url` if given.
 
@@ -1260,7 +1277,12 @@ def build_bsky_client(proxy_url):
     hand that pre-built Request to Client(request=...).
     """
     if not proxy_url:
-        return Client()
+        client = Client()
+        try:
+            _apply_httpx_timeout(client.request)
+        except Exception:
+            pass
+        return client
 
     last_exc = None
     for kwargs in (
@@ -1269,11 +1291,7 @@ def build_bsky_client(proxy_url):
     ):
         try:
             req = AtprotoRequest(**kwargs)
-            # Give slow connections / large video uploads more breathing room
-            try:
-                req._client.timeout = 120.0
-            except Exception:
-                pass
+            _apply_httpx_timeout(req)
             return Client(request=req)
         except TypeError as exc:
             last_exc = exc
@@ -1285,18 +1303,64 @@ def build_bsky_client(proxy_url):
     )
 
 
+def _exception_chain_text(exc):
+    """Flatten an exception and its __cause__/__context__ into one string
+    so timeout markers buried under InvokeTimeoutError are still visible."""
+    parts = []
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        parts.append(f"{type(cur).__name__}: {cur}")
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return " | ".join(parts)
+
+
 def _looks_like_proxy_error(exc):
     """Heuristic: does this exception look like it came from the proxy
     itself being unreachable/broken, rather than a real Bluesky API error
-    (bad credentials, account takedown, etc.)?"""
-    text = f"{type(exc).__name__}: {exc}"
+    (bad credentials, account takedown, etc.)?
+
+    Also treats pure network timeouts (ConnectTimeout / InvokeTimeoutError
+    with no auth/takedown markers) as proxy/network failures so we can
+    rotate the proxy and retry next cycle instead of treating them as
+    fatal account problems."""
+    text = _exception_chain_text(exc)
     markers = (
         "ProxyError", "ConnectError", "ConnectTimeout", "ReadTimeout",
+        "InvokeTimeoutError", "TimeoutError", "timed out",
         "Failed to establish a new connection", "Connection refused",
         "Cannot connect to proxy", "Tunnel connection failed",
         "Max retries exceeded", "RemoteProtocolError", "ConnectionResetError",
+        "Network is unreachable", "Name or service not known",
     )
     return any(m in text for m in markers)
+
+
+def login_with_retry(client, handle, app_pw, attempts=4):
+    """Login with exponential backoff on transient network/timeout errors.
+    Real auth/takedown errors are re-raised immediately (no point retrying)."""
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return client.login(handle, app_pw)
+        except Exception as exc:
+            err = str(exc)
+            # Fatal account problems — do not retry
+            if ("AccountTakedown" in err or "AccountSuspended" in err
+                    or "AuthenticationRequired" in err
+                    or "Invalid identifier or password" in err):
+                raise
+            if not _looks_like_proxy_error(exc):
+                raise
+            last_exc = exc
+            if i == attempts - 1:
+                break
+            wait = min(30, 5 * (2 ** i)) + random.uniform(0, 2)
+            print(f"Login timed out / network error (attempt {i + 1}/{attempts}): "
+                  f"{type(exc).__name__}: {exc} — retrying in {wait:.1f}s…")
+            time.sleep(wait)
+    raise last_exc
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2802,17 +2866,23 @@ def run_once():
         raise NoProxyAvailableError(str(exc)) from exc
 
     try:
-        client.login(handle, cfg["app_pw"])
+        login_with_retry(client, handle, cfg["app_pw"])
     except Exception as exc:
         err = str(exc)
+        # Network / proxy / timeout failure after retries → kill this proxy so
+        # the next cycle claims a fresh one. Do not treat as account ban.
         if proxy_url and _looks_like_proxy_error(exc):
             ip, port = cfg.get("proxy_ip", ""), cfg.get("proxy_port", "")
             if ip and port:
                 release_or_kill_proxy(ip, port, alive=False)
                 _clear_account_proxy()
-            print(f"Login failed through proxy {proxy_url} — marked dead; "
+            print(f"Login failed through proxy {proxy_url} after retries — marked dead; "
                   f"a new proxy will be picked next cycle: {exc}")
-            raise
+            # Surface as NoProxyAvailableError so the cycle exits cleanly
+            # (schedule keeps running) instead of a generic crash.
+            raise NoProxyAvailableError(
+                f"Proxy/network timeout talking to Bluesky via {proxy_url}: {exc}"
+            ) from exc
         if "AccountTakedown" in err or "AccountSuspended" in err:
             raise AccountTakenDownError(f"Account {handle} taken down/suspended.") from exc
         if "AuthenticationRequired" in err or "Invalid identifier or password" in err:
