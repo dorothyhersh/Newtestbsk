@@ -1,0 +1,50 @@
+name: Bluesky Sequential Poster
+
+on:
+  schedule:
+    # Runs every 1 hour (change as you like)
+    - cron: "0 * * * *"
+  workflow_dispatch:   # allows manual run from GitHub UI
+
+jobs:
+  post-sequential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -q google-api-python-client google-auth atproto Pillow requests beautifulsoup4 grapheme
+          curl -s https://rclone.org/install.sh | sudo bash
+
+      - name: Write rclone config
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+
+      - name: Write Google credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > google_creds.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Run rows 23 → 31 (one post each, instantly next)
+        run: python -u bsky_poster.py --rows 23-31
+        env:
+          PYTHONUNBUFFERED: "1"
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
+          START_JITTER_MAX_SECONDS: "5"
+          SHEETS_RETRY_BUDGET_SECONDS: "180"
+          SHEETS_MAX_BACKOFF_SECONDS: "45"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f rclone.conf google_creds.json
